@@ -11,8 +11,8 @@ psycopg-binary==3.3.6
 psycopg2-binary==2.9.13
 pydantic==2.14.1
 pydantic_core==2.50.1
-SQLAlchemy==2.1.5
-starlette==1.9.0
+SQLAlchemy==2.0.50
+starlette==1.7.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
 uvicorn==0.54.0
