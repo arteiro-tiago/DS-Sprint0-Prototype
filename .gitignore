@@ -1,0 +1,18 @@
+# Python & Virtual Environments
+venv/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node & Frontend
+node_modules/
+dist/
+.env.local
+
+# Database
+pgdata/
+
+# OS / Editors
+.DS_Store
+.vscode/
