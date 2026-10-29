@@ -1,16 +1,32 @@
-version: '3.8'
 services:
-  db:
-    image: postgres:15-alpine
-    restart: always
+  workforce-db:
+    image: postgres:17-alpine
+    restart: unless-stopped
     environment:
       POSTGRES_USER: admin
       POSTGRES_PASSWORD: password
-      POSTGRES_DB: research_db
+      POSTGRES_DB: workforce_db
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - workforce_db_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U admin -d workforce_db"]
+      interval: 5s
+      retries: 10
+
+  workforce-api:
+    build: ./backend
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://admin:password@workforce-db:5432/workforce_db
+      ALLOWED_ORIGINS: http://localhost:5173
+    ports:
+      - "8000:8000"
+    depends_on:
+      workforce-db:
+        condition: service_healthy
 
 volumes:
-  pgdata:
+  workforce_db_data:

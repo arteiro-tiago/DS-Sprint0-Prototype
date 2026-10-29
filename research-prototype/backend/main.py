@@ -1,87 +1,134 @@
-from fastapi import FastAPI, Depends
+import os
+from datetime import date
+
+import psycopg
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy.orm import Session
-from models import Base, engine, SessionLocal, Researcher, Project, Publication, ProjectContribution, PublicationAuthor
+from psycopg.rows import dict_row
 
-# Create tables in Postgres
-Base.metadata.create_all(bind=engine)
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://admin:password@localhost:5432/workforce_db")
+ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
 
-app = FastAPI(title="Research Collaboration Microservice")
+app = FastAPI(title="workforce-service", description="High-level people metrics for HumanISE.info")
 
-# Allow React frontend to talk to Python backend
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
-    allow_methods=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET"],
     allow_headers=["*"],
 )
 
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
-# Seed dummy data for Sprint 0 on first run
-@app.on_event("startup")
-def seed_data():
-    db = SessionLocal()
-    if db.query(Researcher).count() == 0:
-        r1 = Researcher(name="Dr. Ana Silva", department="AI & Health")
-        r2 = Researcher(name="Prof. João Costa", department="Bioinformatics")
-        r3 = Researcher(name="Sara Mendes", department="Data Science")
+def run_sql(sql, params=None):
+    with psycopg.connect(DATABASE_URL, row_factory=dict_row) as conn:
+        return conn.execute(sql, params).fetchall()
 
-        p1 = Project(title="Neural Networks in Oncology", status="Active")
-        p2 = Project(title="Genomic Data Pipeline", status="Completed")
 
-        pub1 = Publication(title="Deep Learning for Tumor Detection", year=2025)
-        pub2 = Publication(title="Scalable Genomic Indexing", year=2026)
+@app.get("/health")
+def health():
+    run_sql("SELECT 1")
+    return {"status": "ok", "service": "workforce-service"}
 
-        db.add_all([r1, r2, r3, p1, p2, pub1, pub2])
-        db.commit()
 
-        # Link people to projects & publications
-        db.add_all([
-            ProjectContribution(researcher_id=r1.id, project_id=p1.id, role="Principal Investigator"),
-            ProjectContribution(researcher_id=r3.id, project_id=p1.id, role="ML Engineer"),
-            ProjectContribution(researcher_id=r2.id, project_id=p2.id, role="Project Lead"),
-            ProjectContribution(researcher_id=r3.id, project_id=p2.id, role="Data Engineer"),
-            PublicationAuthor(researcher_id=r1.id, publication_id=pub1.id, author_order=1),
-            PublicationAuthor(researcher_id=r3.id, publication_id=pub1.id, author_order=2),
-            PublicationAuthor(researcher_id=r2.id, publication_id=pub2.id, author_order=1),
-        ])
-        db.commit()
-    db.close()
+@app.get("/api/workforce/summary")
+def get_summary():
+    return run_sql("""
+        SELECT
+            COUNT(*) FILTER (WHERE member_status = 'active')                                     AS active_members,
+            COUNT(*) FILTER (WHERE member_status = 'active' AND employment_type = 'employee')    AS hired,
+            COUNT(*) FILTER (WHERE member_status = 'active' AND employment_type = 'scholarship') AS scholarship_holders,
+            COUNT(*) FILTER (WHERE member_status = 'active' AND employment_type = 'contractor')  AS contractors,
+            COUNT(*) FILTER (WHERE member_status = 'active' AND role ~* 'research')              AS researchers,
+            COUNT(*) FILTER (WHERE member_status = 'former')                                     AS former_members
+        FROM researchers
+    """)[0]
 
-@app.get("/api/breakdown")
-def get_collaboration_breakdown(db: Session = Depends(get_db)):
-    projects = db.query(Project).all()
-    publications = db.query(Publication).all()
 
-    return {
-        "projects": [
-            {
-                "id": p.id,
-                "title": p.title,
-                "status": p.status,
-                "people": [
-                    {"id": c.researcher.id, "name": c.researcher.name, "department": c.researcher.department, "role": c.role}
-                    for c in p.contributors
-                ]
-            }
-            for p in projects
-        ],
-        "publications": [
-            {
-                "id": pub.id,
-                "title": pub.title,
-                "year": pub.year,
-                "authors": [
-                    {"id": a.researcher.id, "name": a.researcher.name, "department": a.researcher.department, "order": a.author_order}
-                    for a in sorted(pub.authors, key=lambda x: x.author_order)
-                ]
-            }
-            for pub in publications
-        ]
-    }
+@app.get("/api/workforce/trend")
+def get_trend():
+    today = date.today()
+    points = []
+
+    for months_ago in range(11, -1, -1):
+        year, month = today.year, today.month - months_ago
+        if month <= 0:
+            year, month = year - 1, month + 12
+        day = today if months_ago == 0 else date(year, month, 1)
+
+        counts = run_sql(
+            """
+            SELECT
+                COUNT(DISTINCT r.id)                                                  AS total,
+                COUNT(DISTINCT r.id) FILTER (WHERE r.employment_type = 'employee')    AS hired,
+                COUNT(DISTINCT r.id) FILTER (WHERE r.employment_type = 'scholarship') AS scholarship_holders,
+                COUNT(DISTINCT r.id) FILTER (WHERE r.employment_type = 'contractor')  AS contractors,
+                COUNT(DISTINCT r.id) FILTER (WHERE r.role ~* 'research')              AS researchers
+            FROM researcher_contracts c
+            JOIN researchers r ON r.id = c.researcher_id
+            WHERE c.start_date <= %(day)s
+              AND (c.end_date IS NULL OR c.end_date >= %(day)s)
+            """,
+            {"day": day},
+        )[0]
+        counts["month"] = day.strftime("%b %y")
+        points.append(counts)
+
+    return points
+
+
+@app.get("/api/workforce/roles")
+def get_roles():
+    return run_sql("""
+        SELECT role,
+               role ~* 'research' AS is_research,
+               COUNT(*)           AS total
+        FROM researchers
+        WHERE member_status = 'active'
+        GROUP BY role
+        ORDER BY total DESC, role
+    """)
+
+
+@app.get("/api/workforce/teams")
+def get_teams():
+    return run_sql("""
+        SELECT
+            t.name,
+            t.status,
+            leader.name                                                                    AS leader,
+            COUNT(r.id) FILTER (WHERE r.member_status = 'active')                          AS active_members,
+            COUNT(r.id) FILTER (WHERE r.member_status = 'active' AND r.role ~* 'research') AS researchers,
+            (SELECT COUNT(DISTINCT a.project_id)
+               FROM researcher_project_assignments a
+               JOIN researchers m ON m.id = a.researcher_id
+               JOIN projects p    ON p.id = a.project_id
+              WHERE m.team_id = t.id AND p.status = 'active')                              AS active_projects,
+            ARRAY(SELECT rt.name
+                    FROM team_topics tt
+                    JOIN research_topics rt ON rt.id = tt.topic_id
+                   WHERE tt.team_id = t.id
+                   ORDER BY rt.name)                                                       AS topics
+        FROM teams t
+        LEFT JOIN researchers leader ON leader.id = t.leader_id
+        LEFT JOIN researchers r      ON r.team_id = t.id
+        GROUP BY t.id, t.name, t.status, leader.name
+        ORDER BY active_members DESC, t.name
+    """)
+
+
+@app.get("/api/workforce/contracts/ending-soon")
+def get_contracts_ending_soon():
+    return run_sql("""
+        SELECT
+            r.name,
+            r.role,
+            t.name                    AS team,
+            c.type                    AS contract_type,
+            c.end_date,
+            c.end_date - CURRENT_DATE AS days_left
+        FROM researcher_contracts c
+        JOIN researchers r ON r.id = c.researcher_id
+        LEFT JOIN teams t  ON t.id = r.team_id
+        WHERE c.end_date BETWEEN CURRENT_DATE AND CURRENT_DATE + 90
+        ORDER BY c.end_date
+    """)
